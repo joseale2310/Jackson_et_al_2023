@@ -1,0 +1,242 @@
+---
+title: Dataset1 tracking plot
+author: Jose Alejandro Romero Herrera
+date: 20/02/2023
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes  
+  html_document:
+    theme: yeti # nice theme for the webpage
+    toc: yes # table of contents
+    toc_float: yes # table of contents "floats" in the document
+    df_print: paged # data frames are interactive
+    dev: png # what format do you want for the figures?
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+DOCNAME = gsub(DOCNAME, pattern = ".Rmd", replacement = "", fixed = T)
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../results/", DOCNAME, "/"), #images will be put in this folder, under the notebook name
+                      message        = FALSE,
+                      warning        = FALSE,
+                      eval           = TRUE)
+```
+
+# Load libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(htmlwidgets)
+library(GenomicRanges)
+```
+
+# Data location
+
+Path and list of branches
+Making it a transpose dataframe to use lapply on the function below.
+
+```{r}
+data_path <- "../data/Dataset_3.xlsx"
+
+branch_df <- data.frame(t(data.frame(position = 1:length(excel_sheets(data_path)),
+                                            name = excel_sheets(data_path))))
+branch_df
+```
+
+# Main function
+
+```{r}
+process_branch <- function(x, file_path, branches_info) {
+  
+  position = as.integer(x[1])
+  branch_name = x[2]
+  
+  replacements <- as.character(branches_info[1,])
+  patterns <- paste0("\\b",branches_info[2,],"\\b")
+    
+  cat(paste0("\n","Processing sheet '", x[2], "' at '", file_path, "'\n"))
+  
+  branch <- read_excel(file_path, sheet = branch_name)
+  branch <- branch %>% dplyr::rename(object = `Surpass Object`, # rename some columns
+                                     end = Time, 
+                                     yend = Bifur) %>% 
+    dplyr::select(c(object, end, yend)) %>% # select only necessary columns
+    mutate(yend = as.numeric(stringi::stri_replace_all_regex(branch$Bifur, # match of the whole word
+                                                             replacement = replacements, 
+                                                             pattern = patterns, vectorize_all = F)))
+  
+  bifurs <- branch %>% filter(grepl(x = object, pattern = "bifur", ignore.case = T)) %>%
+    drop_na() %>% mutate(start = end)
+  
+  foci <- branch %>% dplyr::filter(grepl(x = object, pattern = "foci", ignore.case = T)) %>% 
+    dplyr::select(object, end) %>% drop_na() %>% 
+    mutate(yend = position, nbranch = branch_name, type = gsub(x = object, pattern = " *[0-9]+[a-zA-Z]*", replacement = ""))
+  
+  branch <- branch %>% dplyr::filter(!grepl(x = object, pattern = "bifur|foci", ignore.case = T))
+  branch <- branch %>% dplyr::select(object, end) %>% drop_na() %>% 
+    mutate(start = end) # end is the same as start for now
+  
+  # Create GRanges object to reduce coordinates of branch events
+  branch <- GRanges(seqnames = branch$object, ranges = IRanges(start = branch$start, end = branch$end))
+  branch <- reduce(branch)
+
+  # Format GRanges object with all necessary columns
+  branch <- branch %>% as_tibble() %>% 
+    dplyr::select(c(seqnames, start, end)) %>% 
+    dplyr::rename(object = seqnames) %>% 
+    mutate(yend = position) %>%
+    rbind(bifurs) %>%
+    mutate(nbranch = branch_name, y = position, 
+           yend = replace_na(yend,position),
+           event = factor(str_extract(string = object, pattern = "[a-zA-Z]+"), levels = c("Cont","BPT","Bifurcation", "BPP")))
+  
+  branch_test = NULL
+  for (i in 1:nrow(branch)) {
+    row_event = pull(branch[i,"event"])
+
+    row_width = branch[i,"end"] - branch[i,"start"]
+    
+    if (row_event %in% c("BPT","BPP")){
+      new = branch[i,] #get bpt or bpp line
+      
+      # check for overlaps with other non-cont events
+      # Is there any other event at the start frame of this breakpoint?
+      subset <- branch_test %>% filter(!grepl(event, pattern = "Cont"))
+      subset <- subset %>% filter(start <= new$start & end >= new$start)
+      
+      if (row_width == 0) {
+        new$yend = new$yend + 0.2 * max(length(unique(subset$object)),1)
+        branch_test = bind_rows(branch_test, new)
+        
+        foci <- bind_rows(foci, new %>%
+                      select(object, end, yend, event, nbranch) %>%
+                      dplyr::rename(type = event))
+        
+      } else if (row_width > 0){
+        new$end = new$start
+        new$yend = new$y + 0.2 * (max(length(unique(subset$object)),0) + 1)
+
+        ext = branch[i,]
+        ext$y = ext$y + 0.2 * (max(length(unique(subset$object)),0) + 1)
+        ext$yend = ext$y
+        
+        # end joins again 
+        end = ext
+        end$yend = new$y
+        end$start = end$end
+          
+        branch_test <- rbind(branch_test, new, ext, end)
+        
+        foci <- bind_rows(foci, end %>%
+                            select(object, end, y, event, nbranch) %>%
+                            dplyr::rename(type = event, yend = y))
+      }
+      
+    } else {
+      branch_test = rbind(branch_test, branch[i,])
+    }
+  }
+  foci <- foci  %>% mutate(type = recode(type, BPT = "end_breakpoint", BPP = "end_breakpoint") )
+  return(list(branch_test, foci))
+}
+```
+
+# Join all sheets
+
+```{r}
+#Apply function to all sheets
+data <- lapply(branch_df, FUN = process_branch, file_path = data_path, branches_info = branch_df)
+```
+
+```{r}
+# Join branch info
+branches <- lapply(data, FUN = function(x){
+  return(x[[1]])
+})
+branches <- bind_rows(branches)
+```
+
+```{r}
+# Join foci info
+foci <- lapply(data, FUN = function(x){
+  return(x[[2]])
+})
+foci <- bind_rows(foci)
+```
+
+# Modify data for plotting
+
+```{r}
+foci$type <- factor(foci$type, levels = c("De Novo Foci","Foci D", "end_breakpoint"))
+branches$event <- factor(branches$event, levels = c("Cont", "BPT", "BPP", "Bifurcation"))
+```
+
+Create linesize variable for scale_size_identity
+```{r}
+branches <- branches %>% mutate(linesize = recode(event, Cont = 1.5, BPT = 1, BPP = 1, Bifurcation = 1.5))
+foci <- foci %>% mutate(pointsize = recode(type, `De Novo Foci` = 2.5, `Foci D` = 2.5, end_breakpoint = 1.5))
+```
+
+# Colors
+
+```{r}
+colors <- tolower(c("Grey", "Blue", "Red", "Purple", "Turquoise", "Green", "Gold", "Magenta"))
+```
+
+# Static plot
+
+```{r}
+plot <- ggplot (branches) +
+  geom_segment(aes(x = start, xend = end, y = y, yend = yend, color = nbranch, linetype = event, size = linesize), lineend = "square") + 
+  scale_linetype_manual(values = c("solid","12","dotdash", "solid"), 
+                        labels = c("Cont", "BPT", "BPP", "Bifurcation")) +
+  scale_color_manual(values = colors, labels = gsub(unique(branches$nbranch), pattern = "_", replacement = " ")) + 
+
+  geom_point(data = foci, aes(x = end, y = yend, shape = type, fill = type, size = pointsize)) +
+  scale_shape_manual(values = c("square filled","circle filled","triangle down filled"), 
+                     labels = c("De Novo Foci","Derived Foci", "BP end")) + 
+  scale_fill_manual(values = c("white","white","black")) +
+  
+  scale_size_identity() + #scale size to a new variable that says exactly the sizes for each value
+
+  theme_bw() + theme(axis.ticks.y = element_blank(), 
+                     axis.text.y = element_blank(), 
+                     axis.title.y = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  labs(linetype = "Event", color = "Branch", shape = "Foci type") + xlab("Frame") +
+  guides(linetype = guide_legend(override.aes = list(linetype = c('solid', '14', 'dotdash', 'solid'),
+                                                linewidth = c(1.5, 1, 1, 1.5))), 
+         fill = "none", 
+         shape = guide_legend(override.aes = list(shape = c("square filled","circle filled","triangle down filled"),
+                                                               fill = c("white","white","black"),
+                                                               size = c(2.5,2.5,1.5))))
+```
+
+```{r dataset3_plot, fig.height=5, fig.width=10}
+plot
+```
+```{r}
+ggsave(plot, filename = "../results/Dataset3_plot/dataset3_plot.svg", width = 10, height = 6 )
+ggsave(plot, filename = "../results/Dataset3_plot/dataset3_plot.png", width = 10, height = 6 )
+
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+
